@@ -1,75 +1,101 @@
-# React + TypeScript + Vite
+# SYNTRUST
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+### Sensors report. Evidence decides.
 
-Currently, two official plugins are available:
+SYNTRUST is a sensor integrity and evidence-fusion prototype designed to detect potentially manipulated railway telemetry by comparing multiple sensor signals instead of blindly trusting a single reading.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+The system evaluates sensor behavior, cross-sensor consistency, physical evidence, temporal changes, and sensor trust to classify an event as:
 
-## React Compiler
+- NORMAL
+- GENUINE PHYSICAL EVENT
+- POTENTIAL MANIPULATION
+- INTEGRITY UNCERTAIN
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+> **AI recommends. The operator decides.**
 
-## Expanding the ESLint configuration
+---
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## Problem
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+Modern infrastructure systems depend on multiple sensors to understand what is happening in the physical world.
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+However, a sensor can:
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+- malfunction
+- drift gradually
+- report manipulated values
+- disagree with other sensors
+- become part of a coordinated multi-sensor attack
 
-```
+A simple anomaly detector may identify an unusual value, but that does not necessarily mean the physical event is malicious.
 
-You can also install [eslint-plugin-react-x](https://npmx.dev/package/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://npmx.dev/package/eslint-plugin-react-dom) for React-specific lint rules:
+For example:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+A train slowing down rapidly could be:
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+- a genuine braking event
+- a faulty speed sensor
+- manipulated telemetry
+- a coordinated attack affecting multiple signals
 
-```
+SYNTRUST focuses on the harder question:
+
+> **Can the evidence behind the sensor reading be trusted?**
+
+---
+
+## Solution
+
+SYNTRUST combines multiple telemetry signals and evaluates their consistency before producing an integrity decision.
+
+### Sensor signals used
+
+- Speed
+- GPS speed
+- Wheel RPM
+- Brake pressure
+- Motor current
+
+The system assigns dynamic trust values to sensor signals and combines multiple pieces of evidence to produce an integrity assessment.
+
+---
+
+## Core Architecture
+
+```text
+Sensor / Dataset Input
+        |
+        v
++-------------------------+
+| Telemetry Processing    |
++-------------------------+
+        |
+        v
++-------------------------+
+| Cross-Sensor Analysis   |
+| Speed / GPS / Wheel     |
+| Brake / Motor           |
++-------------------------+
+        |
+        v
++-------------------------+
+| Evidence Evaluation     |
++-------------------------+
+        |
+        v
++-------------------------+
+| Dynamic Sensor Trust    |
++-------------------------+
+        |
+        v
++-------------------------+
+| Integrity Assessment    |
++-------------------------+
+        |
+        v
++-------------------------+
+| Decision + Explanation  |
++-------------------------+
+        |
+        v
+   Operator Dashboard
