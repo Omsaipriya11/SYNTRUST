@@ -87,6 +87,22 @@ interface AccessRequest {
   status: AccessRequestStatus;
 }
 
+type AttackTarget =
+  | "Speed"
+  | "GPS"
+  | "Wheel RPM"
+  | "Multiple Sensors";
+
+type AttackSeverity =
+  | "Mild"
+  | "Moderate"
+  | "Severe";
+
+interface AttackConfig {
+  target: AttackTarget;
+  severity: AttackSeverity;
+}
+
 const scenarios: Scenario[] = [
   {
     id: "normal",
@@ -1290,6 +1306,535 @@ function buildReplayScenario(
 }
 
 /* -------------------------------------------------------
+   ATTACK SIMULATOR
+------------------------------------------------------- */
+
+function applyAttack(
+  baseScenario: Scenario,
+  attack: AttackConfig,
+): {
+  scenario: Scenario;
+  checks: EvidenceCheck[];
+} {
+  const severity =
+    attack.severity === "Mild"
+      ? 1
+      : attack.severity === "Moderate"
+        ? 2
+        : 3;
+  const trustDrop = severity * 18;
+  const sensorDrop = severity * 4;
+  const isMultiple = attack.target === "Multiple Sensors";
+
+  const sensors = baseScenario.sensors.map((sensor) => {
+    const affected = isMultiple || sensor.name === attack.target;
+    if (!affected) return sensor;
+    let value = sensor.value;
+    if (sensor.name === "Speed") {
+      const numeric = Number.parseFloat(sensor.value) || 0;
+      value = Math.max(0, numeric - sensorDrop).toFixed(1);
+    }
+    if (sensor.name === "GPS") {
+      const numeric = Number.parseFloat(sensor.value) || 0;
+      value = (numeric + 0.012 * severity).toFixed(4);
+    }
+    if (sensor.name === "Wheel RPM") {
+      const numeric = Number.parseFloat(sensor.value) || 0;
+      value = Math.max(0, numeric - severity * 70).toFixed(0);
+    }
+    return {
+      ...sensor,
+      value,
+      trust: clamp(sensor.trust - trustDrop, 12, 100),
+      status: severity >= 3 ? "critical" : "warning",
+    };
+  });
+
+  const integrityPenalty = isMultiple ? 32 + severity * 3 : 20 + severity * 5;
+  const integrity = clamp(baseScenario.integrity - integrityPenalty, 12, 100);
+  const injectedSpeed = sensors.find((sensor) => sensor.name === "Speed");
+  const injectedGps = sensors.find((sensor) => sensor.name === "GPS");
+
+  const scenario: Scenario = {
+    ...baseScenario,
+    integrity: Math.round(integrity),
+    speed: injectedSpeed
+      ? `${injectedSpeed.value} km/h`
+      : baseScenario.speed,
+    position: injectedGps
+      ? `${injectedGps.value}° N`
+      : baseScenario.position,
+    status: isMultiple ? "INTEGRITY UNCERTAIN" : "POTENTIAL MANIPULATION",
+    statusType: "critical",
+    description: isMultiple
+      ? "Multiple sensor streams were intentionally altered; agreement cannot establish truth."
+      : `${attack.target} was intentionally altered to test SYNTRUST's evidence engine.`,
+    evidence: isMultiple
+      ? `A ${attack.severity.toLowerCase()} coordinated incident was injected across multiple streams. SYNTRUST reduces trust and reports integrity uncertainty because independent evidence is insufficient.`
+      : `${attack.target} was injected with ${attack.severity.toLowerCase()} severity. SYNTRUST compares the altered reading against the remaining evidence and reduces its trust.`,
+    sensors,
+  };
+
+  const checks: EvidenceCheck[] = isMultiple
+    ? [
+        { label: "Cross-sensor consistency", detail: "Several affected streams can still appear mutually consistent after the injection.", state: "LIMITED" },
+        { label: "Physical consistency", detail: "The simulator does not provide enough independent physical evidence to prove which stream is truthful.", state: "LIMITED" },
+        { label: "Temporal behaviour", detail: `A ${attack.severity.toLowerCase()} coordinated incident is active in the controlled test environment.`, state: "CONFLICT" },
+        { label: "Independent evidence", detail: "Independent evidence is insufficient, so SYNTRUST avoids a false NORMAL decision.", state: "LIMITED" },
+      ]
+    : [
+        { label: "Cross-sensor consistency", detail: `${attack.target} now conflicts with the remaining sensor evidence.`, state: "CONFLICT" },
+        { label: "Physical consistency", detail: "The injected reading is not supported by the unaffected physical signals.", state: "CONFLICT" },
+        { label: "Temporal behaviour", detail: "The controlled injection creates an abrupt deviation from the current operating pattern.", state: "CONFLICT" },
+        { label: "Independent evidence", detail: "Unaffected sensors provide supporting evidence against the injected value.", state: "SUPPORTED" },
+      ];
+
+  return { scenario, checks };
+}
+
+/* -------------------------------------------------------
+   TRUST TIMELINE
+------------------------------------------------------- */
+
+interface TrustTimelinePoint {
+  label: string;
+  trust: number;
+  integrity: number;
+}
+
+function buildTrustTimeline(
+  currentScenario: Scenario,
+  activeAttack: AttackConfig | null,
+  isReplaying: boolean,
+  replayIndex: number,
+  replayLength: number,
+): TrustTimelinePoint[] {
+  if (activeAttack && !isReplaying) {
+    const baseScenario =
+      scenarios.find(
+        (scenario) => scenario.id === currentScenario.id,
+      ) ?? currentScenario;
+
+    const affectedSensors =
+      activeAttack.target === "Multiple Sensors"
+        ? currentScenario.sensors
+        : currentScenario.sensors.filter(
+            (sensor) =>
+              sensor.name === activeAttack.target,
+          );
+
+    const baseAffectedSensors =
+      activeAttack.target === "Multiple Sensors"
+        ? baseScenario.sensors
+        : baseScenario.sensors.filter(
+            (sensor) =>
+              sensor.name === activeAttack.target,
+          );
+
+    const finalTrust =
+      affectedSensors.length > 0
+        ? Math.round(
+            affectedSensors.reduce(
+              (sum, sensor) => sum + sensor.trust,
+              0,
+            ) / affectedSensors.length,
+          )
+        : Math.round(
+            currentScenario.sensors.reduce(
+              (sum, sensor) => sum + sensor.trust,
+              0,
+            ) / currentScenario.sensors.length,
+          );
+
+    const baseTrust =
+      baseAffectedSensors.length > 0
+        ? Math.round(
+            baseAffectedSensors.reduce(
+              (sum, sensor) => sum + sensor.trust,
+              0,
+            ) / baseAffectedSensors.length,
+          )
+        : 0;
+
+    const stages = [
+      { label: "BASE", factor: 0 },
+      { label: "EARLY", factor: 0.25 },
+      { label: "MID", factor: 0.5 },
+      { label: "DETECTED", factor: 0.75 },
+      { label: "CURRENT", factor: 1 },
+    ];
+
+    return stages.map(({ label, factor }) => ({
+      label,
+      trust: Math.round(
+        baseTrust +
+          (finalTrust - baseTrust) * factor,
+      ),
+      integrity: Math.round(
+        baseScenario.integrity +
+          (currentScenario.integrity -
+            baseScenario.integrity) *
+            factor,
+      ),
+    }));
+  }
+
+  if (isReplaying && replayLength > 0) {
+    const data = getScenarioData(
+      datasetScenarioMap[currentScenario.id],
+    );
+    const endIndex = Math.min(
+      replayIndex,
+      data.length - 1,
+    );
+
+    if (endIndex >= 0) {
+      const sampleCount = Math.min(
+        5,
+        endIndex + 1,
+      );
+
+      const sampleIndexes = Array.from(
+        { length: sampleCount },
+        (_, index) =>
+          Math.round(
+            (endIndex * index) /
+              Math.max(1, sampleCount - 1),
+          ),
+      );
+
+      return sampleIndexes.map(
+        (sampleIndex, index) => {
+          const point = data[sampleIndex];
+          const trust = getReplayTrust(
+            currentScenario.id,
+            point,
+          );
+          const averageTrust = Math.round(
+            Object.values(trust).reduce(
+              (sum, value) => sum + value,
+              0,
+            ) / Object.values(trust).length,
+          );
+
+          return {
+            label:
+              index === 4
+                ? "CURRENT"
+                : `${point.timestamp_s}s`,
+            trust: averageTrust,
+            integrity: Math.round(
+              getReplayIntegrity(
+                currentScenario.id,
+                point,
+              ),
+            ),
+          };
+        },
+      );
+    }
+  }
+
+  return [];
+}
+
+function TrustTimeline({
+  currentScenario,
+  activeAttack,
+  isReplaying,
+  replayIndex,
+  replayLength,
+}: {
+  currentScenario: Scenario;
+  activeAttack: AttackConfig | null;
+  isReplaying: boolean;
+  replayIndex: number;
+  replayLength: number;
+}) {
+  const points = buildTrustTimeline(
+    currentScenario,
+    activeAttack,
+    isReplaying,
+    replayIndex,
+    replayLength,
+  );
+
+  if (points.length === 0) {
+    return (
+      <div
+        style={{
+          marginTop: 17,
+          paddingTop: 14,
+          borderTop: "1px solid var(--border)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 10,
+          }}
+        >
+          <div>
+            <span className="eyebrow">TRUST TIMELINE</span>
+            <h4 style={{ margin: "4px 0 0", fontSize: 13 }}>
+              Incident history
+            </h4>
+          </div>
+          <Clock3 size={15} color="var(--muted)" />
+        </div>
+
+        <p
+          style={{
+            fontSize: 9,
+            lineHeight: 1.5,
+            color: "var(--muted)",
+            margin: "10px 0 0",
+          }}
+        >
+          Inject or replay an incident to see how sensor trust and system integrity change over time.
+        </p>
+      </div>
+    );
+  }
+
+  const width = 320;
+  const height = 118;
+  const left = 8;
+  const right = 8;
+  const top = 10;
+  const bottom = 24;
+  const chartWidth = width - left - right;
+  const chartHeight = height - top - bottom;
+
+  const pointFor = (
+    value: number,
+    index: number,
+  ) => ({
+    x:
+      left +
+      (index /
+        Math.max(1, points.length - 1)) *
+        chartWidth,
+    y:
+      top +
+      ((100 - clamp(value)) / 100) *
+        chartHeight,
+  });
+
+  const trustPoints = points
+    .map((point, index) => {
+      const p = pointFor(point.trust, index);
+      return `${p.x},${p.y}`;
+    })
+    .join(" ");
+
+  const integrityPoints = points
+    .map((point, index) => {
+      const p = pointFor(point.integrity, index);
+      return `${p.x},${p.y}`;
+    })
+    .join(" ");
+
+  return (
+    <div
+      style={{
+        marginTop: 17,
+        paddingTop: 14,
+        borderTop: "1px solid var(--border)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 10,
+        }}
+      >
+        <div>
+          <span className="eyebrow">TRUST TIMELINE</span>
+          <h4 style={{ margin: "4px 0 0", fontSize: 13 }}>
+            Trust vs system integrity
+          </h4>
+        </div>
+
+        <span
+          style={{
+            fontSize: 8,
+            color: "var(--red)",
+            fontWeight: 700,
+            letterSpacing: ".05em",
+          }}
+        >
+          {isReplaying ? "REPLAY" : "INJECTION"}
+        </span>
+      </div>
+
+      <div
+        style={{
+          marginTop: 10,
+          border: "1px solid var(--border)",
+          borderRadius: 8,
+          padding: "8px 7px 5px",
+          background: "#fbfcfd",
+          overflow: "hidden",
+        }}
+      >
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          width="100%"
+          height="118"
+          role="img"
+          aria-label="Trust and system integrity timeline"
+        >
+          {[0, 25, 50, 75, 100].map((value) => {
+            const y = pointFor(value, 0).y;
+            return (
+              <line
+                key={value}
+                x1={left}
+                x2={width - right}
+                y1={y}
+                y2={y}
+                stroke="#e7ebef"
+                strokeWidth="1"
+              />
+            );
+          })}
+
+          <polyline
+            points={integrityPoints}
+            fill="none"
+            stroke="#9aa7b4"
+            strokeWidth="2"
+            strokeDasharray="5 4"
+          />
+
+          <polyline
+            points={trustPoints}
+            fill="none"
+            stroke="var(--navy2)"
+            strokeWidth="3"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+
+          {points.map((point, index) => {
+            const trustPoint = pointFor(point.trust, index);
+            const integrityPoint = pointFor(
+              point.integrity,
+              index,
+            );
+
+            return (
+              <g key={`${point.label}-${index}`}>
+                <circle
+                  cx={trustPoint.x}
+                  cy={trustPoint.y}
+                  r="3.5"
+                  fill="var(--navy2)"
+                />
+                <circle
+                  cx={integrityPoint.x}
+                  cy={integrityPoint.y}
+                  r="2.5"
+                  fill="#9aa7b4"
+                />
+                <text
+                  x={trustPoint.x}
+                  y={height - 7}
+                  textAnchor="middle"
+                  fontSize="7"
+                  fill="#8491a0"
+                >
+                  {point.label}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+
+        <div
+          style={{
+            display: "flex",
+            gap: 14,
+            margin: "0 5px 2px",
+            fontSize: 8,
+            color: "var(--muted)",
+          }}
+        >
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <i
+              style={{
+                width: 14,
+                height: 3,
+                display: "inline-block",
+                background: "var(--navy2)",
+                borderRadius: 3,
+              }}
+            />
+            Trust
+          </span>
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <i
+              style={{
+                width: 14,
+                height: 0,
+                display: "inline-block",
+                borderTop: "2px dashed #9aa7b4",
+              }}
+            />
+            Integrity
+          </span>
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: 8,
+          marginTop: 8,
+        }}
+      >
+        <div
+          style={{
+            padding: "7px 8px",
+            background: "#f6f8fa",
+            border: "1px solid var(--border)",
+            borderRadius: 7,
+          }}
+        >
+          <span style={{ fontSize: 7, color: "var(--muted)", fontWeight: 700 }}>
+            CURRENT TRUST
+          </span>
+          <strong style={{ display: "block", marginTop: 2, fontSize: 13 }}>
+            {points[points.length - 1].trust}%
+          </strong>
+        </div>
+        <div
+          style={{
+            padding: "7px 8px",
+            background: "#f6f8fa",
+            border: "1px solid var(--border)",
+            borderRadius: 7,
+          }}
+        >
+          <span style={{ fontSize: 7, color: "var(--muted)", fontWeight: 700 }}>
+            CURRENT INTEGRITY
+          </span>
+          <strong style={{ display: "block", marginTop: 2, fontSize: 13 }}>
+            {points[points.length - 1].integrity}%
+          </strong>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------
    APP
 ------------------------------------------------------- */
 
@@ -1342,6 +1887,15 @@ function App() {
   const [replayIndex, setReplayIndex] =
     useState(0);
 
+  const [attackTarget, setAttackTarget] =
+    useState<AttackTarget>("Speed");
+
+  const [attackSeverity, setAttackSeverity] =
+    useState<AttackSeverity>("Moderate");
+
+  const [activeAttack, setActiveAttack] =
+    useState<AttackConfig | null>(null);
+
   const replayData = getScenarioData(
     datasetScenarioMap[selectedScenario],
   );
@@ -1361,7 +1915,7 @@ function App() {
       (s) => s.id === activeScenario,
     ) ?? scenarios[0];
 
-  const currentScenario =
+  const baseScenario =
     replayPoint
       ? buildReplayScenario(
           staticScenario,
@@ -1371,16 +1925,23 @@ function App() {
         )
       : staticScenario;
 
+  const attackResult =
+    !replayPoint && activeAttack
+      ? applyAttack(baseScenario, activeAttack)
+      : undefined;
+
+  const currentScenario =
+    attackResult?.scenario ?? baseScenario;
+
   const checks =
-    replayPoint
+    attackResult?.checks ??
+    (replayPoint
       ? getReplayEvidence(
           activeScenario,
           replayPoint,
           replayIndex,
         )
-      : evidenceFor(
-          currentScenario.id,
-        );
+      : evidenceFor(currentScenario.id));
 
   const statusClass =
     currentScenario.statusType;
@@ -1467,14 +2028,14 @@ function App() {
     setMobileMenu(false);
     setIsReplaying(false);
     setReplayIndex(0);
+    setActiveAttack(null);
   };
 
   const runScenario = () => {
     setIsReplaying(false);
     setReplayIndex(0);
-    setActiveScenario(
-      selectedScenario,
-    );
+    setActiveAttack(null);
+    setActiveScenario(selectedScenario);
   };
 
   const startReplay = () => {
@@ -1487,9 +2048,8 @@ function App() {
      * timeout. This avoids a stale replay starting
      * after the user changes scenario or stops it.
      */
-    setActiveScenario(
-      selectedScenario,
-    );
+    setActiveAttack(null);
+    setActiveScenario(selectedScenario);
     setReplayIndex(0);
     setIsReplaying(true);
   };
@@ -1498,12 +2058,22 @@ function App() {
     setIsReplaying(false);
   };
 
-  const handleScenarioSelect = (
-    id: ScenarioId,
-  ) => {
+  const handleScenarioSelect = (id: ScenarioId) => {
     setIsReplaying(false);
     setReplayIndex(0);
+    setActiveAttack(null);
     setSelectedScenario(id);
+  };
+
+  const injectAttack = () => {
+    if (isReplaying) return;
+    setActiveScenario(selectedScenario);
+    setReplayIndex(0);
+    setActiveAttack({ target: attackTarget, severity: attackSeverity });
+  };
+
+  const clearAttack = () => {
+    setActiveAttack(null);
   };
 
   const scrollTo = (id: string) => {
@@ -1579,6 +2149,13 @@ function App() {
       scrollTo={scrollTo}
       onLogout={logout}
       statusClass={statusClass}
+      attackTarget={attackTarget}
+      setAttackTarget={setAttackTarget}
+      attackSeverity={attackSeverity}
+      setAttackSeverity={setAttackSeverity}
+      activeAttack={activeAttack}
+      injectAttack={injectAttack}
+      clearAttack={clearAttack}
     />
   );
 }
@@ -1777,6 +2354,13 @@ function OperatorScreen({
   scrollTo,
   onLogout,
   statusClass,
+  attackTarget,
+  setAttackTarget,
+  attackSeverity,
+  setAttackSeverity,
+  activeAttack,
+  injectAttack,
+  clearAttack,
 }: {
   currentScenario: Scenario;
   selectedScenario: ScenarioId;
@@ -1796,6 +2380,13 @@ function OperatorScreen({
   scrollTo: (id: string) => void;
   onLogout: () => void;
   statusClass: SensorStatus;
+  attackTarget: AttackTarget;
+  setAttackTarget: (target: AttackTarget) => void;
+  attackSeverity: AttackSeverity;
+  setAttackSeverity: (severity: AttackSeverity) => void;
+  activeAttack: AttackConfig | null;
+  injectAttack: () => void;
+  clearAttack: () => void;
 }) {
   const replayProgress =
     replayLength > 0
@@ -2338,11 +2929,34 @@ function OperatorScreen({
                       ? "stop"
                       : ""
                   }`}
+                  style={{
+                    width: "100%",
+                    border: isReplaying
+                      ? "1px solid #ecc5c5"
+                      : "1px solid var(--navy)",
+                    background: isReplaying
+                      ? "var(--red-soft)"
+                      : "var(--navy)",
+                    color: isReplaying
+                      ? "var(--red)"
+                      : "#fff",
+                    padding: "11px",
+                    borderRadius: "7px",
+                    fontSize: "10px",
+                    fontWeight: 700,
+                    letterSpacing: ".06em",
+                    display: "flex",
+                    justifyContent: "center",
+                    alignItems: "center",
+                    gap: "8px",
+                    marginTop: "12px",
+                  }}
                   onClick={
                     isReplaying
                       ? stopReplay
                       : startReplay
                   }
+                  type="button"
                 >
                   {isReplaying
                     ? "STOP REPLAY"
@@ -2425,6 +3039,83 @@ function OperatorScreen({
                   </div>
                 </div>
               )}
+
+              <div className="attack-simulator" style={{ marginTop: 18, paddingTop: 18, borderTop: "1px solid rgba(97, 114, 134, 0.18)" }}>
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 14 }}>
+                  <div>
+                    <span className="eyebrow">CONTROLLED TEST</span>
+                    <h4 style={{ margin: "4px 0 0" }}>Attack Simulator</h4>
+                  </div>
+                  {activeAttack && <span className="live-indicator" style={{ whiteSpace: "nowrap" }}><span />INCIDENT INJECTED</span>}
+                </div>
+
+                <p className="panel-description">Inject a controlled sensor fault and observe how trust, integrity and evidence change.</p>
+
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
+                  <div>
+                    <span className="eyebrow">TARGET SENSOR</span>
+                    <div className="scenario-options" style={{ marginTop: 8 }}>
+                      {(["Speed", "GPS", "Wheel RPM", "Multiple Sensors"] as AttackTarget[]).map((target) => (
+                        <button key={target} className={`scenario-option ${attackTarget === target ? "selected" : ""}`} onClick={() => setAttackTarget(target)} disabled={isReplaying} type="button">
+                          <span className="scenario-radio" /><span>{target}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <span className="eyebrow">ATTACK SEVERITY</span>
+                    <div className="scenario-options" style={{ marginTop: 8 }}>
+                      {(["Mild", "Moderate", "Severe"] as AttackSeverity[]).map((severity) => (
+                        <button key={severity} className={`scenario-option ${attackSeverity === severity ? "selected" : ""}`} onClick={() => setAttackSeverity(severity)} disabled={isReplaying} type="button">
+                          <span className="scenario-radio" /><span>{severity}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="scenario-action-row" style={{ marginTop: 12 }}>
+                  <button className="run-button" onClick={injectAttack} disabled={isReplaying} type="button">
+                    {activeAttack ? "RE-INJECT INCIDENT" : "INJECT INCIDENT"}<span>→</span>
+                  </button>
+                  {activeAttack && (
+                    <button
+                      className="replay-button"
+                      onClick={clearAttack}
+                      disabled={isReplaying}
+                      type="button"
+                      style={{
+                        width: "100%",
+                        border: "1px solid var(--border)",
+                        background: "#fff",
+                        color: "var(--steel)",
+                        padding: "10px 11px",
+                        borderRadius: "7px",
+                        fontSize: "9px",
+                        fontWeight: 700,
+                        letterSpacing: ".05em",
+                        display: "flex",
+                        justifyContent: "center",
+                        alignItems: "center",
+                        gap: "7px",
+                        marginTop: "12px",
+                      }}
+                    >
+                      CLEAR INCIDENT
+                      <span>×</span>
+                    </button>
+                  )}
+                </div>
+
+                {activeAttack && <div className="replay-status" style={{ marginTop: 12 }}>
+                  <div className="replay-status-header">
+                    <div className="replay-status-title"><span className="replay-live-dot" /><span>ACTIVE INJECTION</span></div>
+                    <strong>{activeAttack.target} · {activeAttack.severity}</strong>
+                  </div>
+                  <div style={{ marginTop: 10, fontSize: 13, lineHeight: 1.5, color: "var(--muted, #617286)" }}>SYNTRUST has recalculated the sensor trust and system integrity using the injected incident.</div>
+                </div>}
+              </div>
             </div>
 
             {/* TRUST */}
@@ -2478,6 +3169,14 @@ function OperatorScreen({
                   sensor truth.
                 </span>
               </div>
+
+              <TrustTimeline
+                currentScenario={currentScenario}
+                activeAttack={activeAttack}
+                isReplaying={isReplaying}
+                replayIndex={replayIndex}
+                replayLength={replayLength}
+              />
             </div>
 
             {/* EVIDENCE */}
